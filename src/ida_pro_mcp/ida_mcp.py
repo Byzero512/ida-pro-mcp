@@ -4,6 +4,7 @@ This file serves as the entry point for IDA Pro's plugin system.
 It loads the actual implementation from the ida_mcp package.
 """
 
+import os
 import sys
 import idaapi
 import ida_kernwin
@@ -152,9 +153,16 @@ class MCP(idaapi.plugin_t):
             hotkey = hotkey.replace("Alt", "Option")
 
         self.mcp: "ida_mcp.rpc.McpServer | None" = None
-        self.host = self.DEFAULT_HOST
-        self.port = self.DEFAULT_PORT
-        self.autostart = _get_autostart()
+        # self.host = self.DEFAULT_HOST
+        # self.port = self.DEFAULT_PORT
+        self.host = os.environ.get("IDAMCP_HOST", self.DEFAULT_HOST)
+        self.port = int(os.environ.get("IDAMCP_PORT", str(self.DEFAULT_PORT)))
+
+        try:
+            self.autostart = bool(int(os.environ.get("IDAMCP_AUTOSTART", str(1 if _get_autostart() else 0))))
+        except:
+            print(f"[MCP] Warning: Invalid value for IDAMCP_AUTOSTART, defaulting to {_get_autostart()}")
+            self.autostart = _get_autostart()
 
         if self.autostart and ida_kernwin.is_idaq():
             print("[MCP] Plugin loaded, server will start automatically")
@@ -261,5 +269,4 @@ class MCP(idaapi.plugin_t):
 
 def PLUGIN_ENTRY():
     return MCP()
-
 
