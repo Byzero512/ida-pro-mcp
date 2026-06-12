@@ -19,6 +19,7 @@ from .utils import (
     get_type_by_name,
     parse_decls_ctypes,
     my_modifier_t,
+    hexrays_local_var_exists,
     read_bytes_bss_safe,
     read_int_bss_safe,
     StructRead,
@@ -29,6 +30,7 @@ from .utils import (
     EnumUpsert,
 )
 from . import compat
+from .compat import tinfo_get_udm
 
 
 class DeclareTypeResult(TypedDict, total=False):
@@ -891,7 +893,7 @@ def _infer_type_edit_kind(edit: dict) -> str:
             if fn:
                 frame_tif = ida_typeinf.tinfo_t()
                 if ida_frame.get_func_frame(frame_tif, fn):
-                    _, udm = frame_tif.get_udm(str(edit["name"]))
+                    _, udm = tinfo_get_udm(frame_tif, str(edit["name"]))
                     if udm:
                         return "stack"
         except Exception:
@@ -918,7 +920,11 @@ def _apply_type_edit(edit: dict[str, Any]) -> SetTypeResult:
             ok = ida_typeinf.apply_tinfo(func.start_ea, tif, ida_typeinf.PT_SIL)
             result = {"edit": edit, "kind": kind, "ok": ok}
             if not ok:
-                result["error"] = "Failed to apply function type"
+                result["error"] = (
+                    f"Failed to apply function type at {hex(func.start_ea)} for signature "
+                    f"{signature!r}; ensure all referenced types are declared in the local "
+                    "type library"
+                )
             return result
 
         if kind == "global":
@@ -940,7 +946,9 @@ def _apply_type_edit(edit: dict[str, Any]) -> SetTypeResult:
             ok = ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.PT_SIL)
             result = {"edit": edit, "kind": kind, "ok": ok}
             if not ok:
-                result["error"] = "Failed to apply global type"
+                result["error"] = (
+                    f"Failed to apply global type at {hex(ea)} for type {type_text!r}"
+                )
             return result
 
         if kind == "local":
@@ -956,11 +964,20 @@ def _apply_type_edit(edit: dict[str, Any]) -> SetTypeResult:
                 return {"edit": edit, "kind": kind, "error": "Function not found"}
 
             new_tif = _parse_type_tinfo(type_text)
+
             modifier = my_modifier_t(var_name, new_tif)
             ok = ida_hexrays.modify_user_lvars(func.start_ea, modifier)
             result = {"edit": edit, "kind": kind, "ok": ok}
             if not ok:
-                result["error"] = "Failed to apply local variable type"
+                if not hexrays_local_var_exists(func.start_ea, var_name):
+                    result["error"] = (
+                        f"Local variable {var_name!r} not found in function at "
+                        f"{hex(func.start_ea)}"
+                    )
+                else:
+                    result["error"] = (
+                        f"Failed to apply type {type_text!r} to local variable {var_name!r}"
+                    )
             return result
 
         if kind == "stack":
@@ -979,7 +996,7 @@ def _apply_type_edit(edit: dict[str, Any]) -> SetTypeResult:
             if not ida_frame.get_func_frame(frame_tif, func):
                 return {"edit": edit, "kind": kind, "error": "No frame available"}
 
-            idx, udm = frame_tif.get_udm(stack_name)
+            idx, udm = tinfo_get_udm(frame_tif, stack_name)
             if not udm:
                 return {
                     "edit": edit,
@@ -996,7 +1013,10 @@ def _apply_type_edit(edit: dict[str, Any]) -> SetTypeResult:
             ok = ida_frame.set_frame_member_type(func, offset, tif)
             result = {"edit": edit, "kind": kind, "ok": ok}
             if not ok:
-                result["error"] = "Failed to set stack member type"
+                result["error"] = (
+                    f"Failed to set stack member type for {stack_name!r} at offset "
+                    f"{offset} in function at {hex(func.start_ea)}"
+                )
             return result
 
         return {"edit": edit, "kind": kind, "error": f"Unknown kind: {kind}"}

@@ -69,7 +69,7 @@ def test_decompile_invalid_address():
     """decompile reports an error for an unmapped address."""
     result = decompile(get_unmapped_address())
     assert result["code"] is None
-    assert_error(result)
+    assert_error(result, contains="Decompilation failed")
 
 
 @test()
@@ -102,6 +102,22 @@ def test_decompile_unknown_name():
     result = decompile("nonexistent_function_xyz")
     assert result["code"] is None
     assert_error(result, contains="Not found")
+
+
+@test(binary="crackme03.elf")
+def test_decompile_default_includes_address_markers():
+    """Default output carries /*0xNNNN*/ markers on at least one line."""
+    result = decompile("main")
+    assert_ok(result, "code")
+    assert "/*0x" in result["code"]
+
+
+@test(binary="crackme03.elf")
+def test_decompile_include_addresses_false_strips_markers():
+    """include_addresses=False drops all /*0xNNNN*/ markers."""
+    result = decompile("main", include_addresses=False)
+    assert_ok(result, "code")
+    assert "/*0x" not in result["code"]
 
 
 @test()
@@ -224,6 +240,170 @@ def test_disasm_interior_address_preserves_cursor():
 
 
 @test(binary="crackme03.elf")
+def test_decompile_refs_include_check_pw():
+    """decompile surfaces cot_obj refs, including the check_pw call target."""
+    result = decompile(CRACKME_MAIN)
+    assert_ok(result, "code")
+    refs = result.get("refs", [])
+    hit = next((r for r in refs if r["name"] == "check_pw"), None)
+    assert hit is not None, f"check_pw not in decompile refs: {refs}"
+    assert hit["addr"] == CRACKME_CHECK_PW
+
+
+@test(binary="crackme03.elf")
+def test_decompile_refs_decode_usage_string():
+    """decompile refs carry decoded bytes for string-literal data targets."""
+    result = decompile(CRACKME_MAIN)
+    assert_ok(result, "code")
+    refs = result.get("refs", [])
+    hit = next((r for r in refs if r["addr"] == CRACKME_USAGE_STRING), None)
+    assert hit is not None, f"usage-string ref missing: {refs}"
+    assert "string" in hit, f"decoded string missing on ref: {hit}"
+    assert "Need exactly" in hit["string"]
+
+
+@test(binary="crackme03.elf")
+def test_disasm_labels_populated():
+    """disasm populates `label` on the function head and on branch targets."""
+    result = disasm(CRACKME_MAIN, max_instructions=200)
+    assert_ok(result, "asm")
+    lines = result["asm"]["lines"]
+    first = lines[0]
+    assert first["addr"] == CRACKME_MAIN.removeprefix("0x")
+    assert first.get("label") == "main"
+    # At least one interior branch-target label should be present
+    interior_labels = [ln["label"] for ln in lines[1:] if "label" in ln]
+    assert interior_labels, "expected at least one interior label (e.g. loc_...)"
+
+
+@test(binary="crackme03.elf")
+def test_disasm_resolves_call_target():
+    """disasm resolves `call check_pw` to a ref pointing at CRACKME_CHECK_PW."""
+    result = disasm(CRACKME_MAIN, max_instructions=200)
+    assert_ok(result, "asm")
+    call_line = next(
+        (ln for ln in result["asm"]["lines"] if ln["addr"] == CRACKME_CALL_TO_CHECK_PW.removeprefix("0x")),
+        None,
+    )
+    assert call_line is not None, "missing expected call-to-check_pw line"
+    refs = call_line.get("refs", [])
+    hit = next((r for r in refs if r["name"] == "check_pw"), None)
+    assert hit is not None, f"check_pw not in refs: {refs}"
+    assert hit["addr"] == CRACKME_CHECK_PW
+
+
+@test(binary="crackme03.elf")
+def test_disasm_branch_ref_uses_local_label():
+    """A branch to an in-function label must resolve to the label, not `main`."""
+    result = disasm(CRACKME_MAIN, max_instructions=200)
+    assert_ok(result, "asm")
+    branch_refs = [
+        r
+        for ln in result["asm"]["lines"]
+        for r in ln.get("refs", [])
+        if r["name"].startswith("loc_")
+    ]
+    assert branch_refs, "expected at least one loc_* branch ref inside main"
+    for ref in branch_refs:
+        assert ref["name"] != "main", f"containing function leaked into ref: {ref}"
+
+
+@test(binary="crackme03.elf")
+def test_disasm_resolves_data_ref():
+    """disasm resolves a load of the usage string to a data ref with its symbol."""
+    result = disasm(CRACKME_MAIN, max_instructions=200)
+    assert_ok(result, "asm")
+    hits = [
+        r
+        for ln in result["asm"]["lines"]
+        for r in ln.get("refs", [])
+        if r["addr"] == CRACKME_USAGE_STRING
+    ]
+    assert hits, "expected a data ref to the usage string"
+
+
+@test(binary="crackme03.elf")
+def test_disasm_captures_comments():
+    """disasm surfaces a user-set comment on an instruction line."""
+    import ida_bytes
+
+    ea = int(CRACKME_CALL_TO_CHECK_PW, 16)
+    marker = "mcp-test-comment"
+    prev = ida_bytes.get_cmt(ea, False)
+    try:
+        ida_bytes.set_cmt(ea, marker, False)
+        result = disasm(CRACKME_MAIN, max_instructions=200)
+        assert_ok(result, "asm")
+        line = next(
+            (ln for ln in result["asm"]["lines"] if ln["addr"] == CRACKME_CALL_TO_CHECK_PW.removeprefix("0x")),
+            None,
+        )
+        assert line is not None
+        assert marker in line.get("comments", []), f"comment missing: {line}"
+    finally:
+        ida_bytes.set_cmt(ea, prev or "", False)
+
+
+@test(binary="crackme03.elf")
+def test_disasm_captures_repeatable_and_extra_comments():
+    """disasm surfaces repeatable comments and anterior/posterior extra comments."""
+    import ida_bytes
+    import ida_lines
+
+    ea = int(CRACKME_CALL_TO_CHECK_PW, 16)
+    prev_rep = ida_bytes.get_cmt(ea, True)
+    try:
+        ida_bytes.set_cmt(ea, "rep-marker", True)
+        ida_lines.update_extra_cmt(ea, ida_lines.E_PREV, "ante-marker-0")
+        ida_lines.update_extra_cmt(ea, ida_lines.E_PREV + 1, "ante-marker-1")
+        ida_lines.update_extra_cmt(ea, ida_lines.E_NEXT, "post-marker")
+
+        result = disasm(CRACKME_MAIN, max_instructions=200)
+        assert_ok(result, "asm")
+        line = next(
+            (
+                ln
+                for ln in result["asm"]["lines"]
+                if ln["addr"] == CRACKME_CALL_TO_CHECK_PW.removeprefix("0x")
+            ),
+            None,
+        )
+        assert line is not None
+        comments = line.get("comments", [])
+        for marker in ("rep-marker", "ante-marker-0", "ante-marker-1", "post-marker"):
+            assert marker in comments, f"{marker} missing: {comments}"
+        # Ordering contract: anterior (multi-line, in order) -> inline -> posterior
+        assert (
+            comments.index("ante-marker-0")
+            < comments.index("ante-marker-1")
+            < comments.index("rep-marker")
+            < comments.index("post-marker")
+        )
+    finally:
+        ida_bytes.set_cmt(ea, prev_rep or "", True)
+        ida_lines.del_extra_cmt(ea, ida_lines.E_PREV)
+        ida_lines.del_extra_cmt(ea, ida_lines.E_PREV + 1)
+        ida_lines.del_extra_cmt(ea, ida_lines.E_NEXT)
+
+
+@test(binary="crackme03.elf")
+def test_disasm_ref_decodes_string_literal():
+    """A data ref targeting a string literal carries the decoded bytes."""
+    result = disasm(CRACKME_MAIN, max_instructions=200)
+    assert_ok(result, "asm")
+    usage_refs = [
+        r
+        for ln in result["asm"]["lines"]
+        for r in ln.get("refs", [])
+        if r["addr"] == CRACKME_USAGE_STRING
+    ]
+    assert usage_refs, "expected a ref to the usage string"
+    with_string = [r for r in usage_refs if "string" in r]
+    assert with_string, f"no ref carried a decoded string: {usage_refs}"
+    assert "Need exactly" in with_string[0]["string"]
+
+
+@test(binary="crackme03.elf")
 def test_xrefs_to_check_pw_from_main():
     """xrefs_to(check_pw) includes the known call from main."""
     result = xrefs_to(CRACKME_CHECK_PW)
@@ -257,12 +437,47 @@ def test_xrefs_to_by_name():
 
 @test()
 def test_xrefs_to_invalid():
-    """xrefs_to reports an error or empty xrefs for an invalid address."""
+    """xrefs_to reports an error for an unmapped address."""
     result = xrefs_to(get_unmapped_address())
     assert_is_list(result, min_length=1)
     assert result[0]["addr"] == get_unmapped_address()
-    if result[0].get("xrefs") is None:
-        assert_error(result[0])
+    assert result[0].get("xrefs") is None
+    assert_error(result[0], contains="Address not mapped")
+
+
+def _find_address_without_xrefs() -> str | None:
+    """Return a mapped address with no incoming xrefs, if one exists."""
+    import ida_bytes
+    import idaapi
+    import idautils
+
+    for seg_ea in idautils.Segments():
+        seg = idaapi.getseg(seg_ea)
+        if seg is None:
+            continue
+        for head in idautils.Heads(seg.start_ea, min(seg.end_ea, seg.start_ea + 0x4000)):
+            if not ida_bytes.is_mapped(head):
+                continue
+            if not any(True for _ in idautils.XrefsTo(head)):
+                return hex(head)
+    return None
+
+
+@test()
+def test_xrefs_to_zero_xrefs_message():
+    """xrefs_to explains when a mapped address has no incoming xrefs."""
+    addr = _find_address_without_xrefs()
+    if addr is None:
+        skip_test("binary has no mapped address without incoming xrefs")
+
+    result = xrefs_to(addr)
+    assert_is_list(result, min_length=1)
+    entry = result[0]
+    assert entry["addr"] == addr
+    assert entry.get("error") in (None, "")
+    assert entry.get("xref_count") == 0
+    assert entry.get("xrefs") == []
+    assert "No cross-references" in (entry.get("message") or "")
 
 
 @test()

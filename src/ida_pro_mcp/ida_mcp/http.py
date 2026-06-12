@@ -1,11 +1,13 @@
 import html
 import json
+import logging
 import re
 import ida_netnode
 from urllib.parse import urlparse, parse_qs
 from typing import TypeVar, cast
 from http.server import HTTPServer
 
+from .profile import dump_profile, parse_profile
 from .sync import idasync
 from .rpc import (
     McpRpcRegistry,
@@ -15,6 +17,8 @@ from .rpc import (
     get_cached_output,
 )
 
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -28,8 +32,11 @@ def config_json_get(key: str, default: T) -> T:
     try:
         return json.loads(json_blob)
     except Exception as e:
-        print(
-            f"[WARNING] Invalid JSON stored in netnode '{key}': '{json_blob}' from netnode: {e}"
+        logger.warning(
+            "Invalid JSON stored in netnode %r: %r from netnode: %s",
+            key,
+            json_blob,
+            e,
         )
         return default
 
@@ -57,15 +64,6 @@ def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
 
     if new_tools:
         enabled_tools.update({name: True for name in new_tools})
-
-    try:
-        from .api_discovery import _LOCAL_TOOL_NAMES as PROTECTED_TOOLS
-    except Exception:
-        PROTECTED_TOOLS = set()
-
-    for name in PROTECTED_TOOLS:
-        if name in original_tools:
-            enabled_tools[name] = True
 
     if enabled_tools != original_enabled_tools:
         config_json_set(config_key, enabled_tools)
@@ -116,13 +114,7 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
                 return
             self._handle_config_post()
         else:
-            # Mark proxied requests so _redirecting_dispatch won't re-proxy (loop prevention)
-            from .api_discovery import PROXY_HEADER, set_request_proxied
-            set_request_proxied(self.headers.get(PROXY_HEADER) == "1")
-            try:
-                super().do_POST()
-            finally:
-                set_request_proxied(False)
+            super().do_POST()
 
     def do_GET(self):
         """Handles GET requests."""
@@ -135,6 +127,12 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
             self._handle_config_get()
             return
 
+        if path == "/profile.txt":
+            if not self._check_host():
+                return
+            self._handle_profile_export()
+            return
+
         # Handle output download requests
         output_match = re.match(r"^/output/([a-f0-9-]+)\.(\w+)$", path)
         if output_match:
@@ -144,6 +142,22 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
             return
 
         super().do_GET()
+
+    def _handle_profile_export(self):
+        """Return the currently enabled tools as a profile file."""
+        enabled = sorted(self.mcp_server.tools.methods.keys())
+        body = dump_profile(
+            enabled,
+            header="ida-pro-mcp profile exported from /config.html",
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header(
+            "Content-Disposition", 'attachment; filename="ida-mcp-profile.txt"'
+        )
+        self.end_headers()
+        self.wfile.write(body)
 
     def _handle_output_download(self, output_id: str, extension: str):
         """Handle download of cached output data."""
@@ -180,28 +194,25 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         return cast(HTTPServer, self.server).server_port
 
     def _check_origin(self) -> bool:
+        """Validate Origin for config POST requests.
+
+        Delegates to the zeromcp ``_check_api_request`` which already
+        handles non-loopback bindings (LAN) and respects the configured
+        CORS policy.  When the server is bound to 0.0.0.0 the Host
+        check passes for any client; the Origin check still enforces
+        the CORS policy so ``unrestricted`` is needed for browser-based
+        LAN config access.
         """
-        Prevents CSRF and DNS rebinding attacks by ensuring POST requests
-        originate from pages served by this server, not external websites.
-        """
-        origin = self.headers.get("Origin")
-        port = self.server_port
-        if origin not in (f"http://127.0.0.1:{port}", f"http://localhost:{port}"):
-            self.send_error(403, "Invalid Origin")
-            return False
-        return True
+        return self._check_api_request()
 
     def _check_host(self) -> bool:
+        """Validate Host header for config page access.
+
+        Delegates to ``_check_api_request`` so the same rules apply as
+        for MCP API calls: loopback-bound servers only accept loopback
+        Host headers; non-loopback servers (0.0.0.0) accept any Host.
         """
-        Prevents DNS rebinding attacks where an attacker's domain (e.g., evil.com)
-        resolves to 127.0.0.1, allowing their page to read localhost resources.
-        """
-        host = self.headers.get("Host")
-        port = self.server_port
-        if host not in (f"127.0.0.1:{port}", f"localhost:{port}"):
-            self.send_error(403, "Invalid Host")
-            return False
-        return True
+        return self._check_api_request()
 
     def _send_html(self, status: int, text: str):
         """
@@ -367,6 +378,11 @@ input[type="submit"]:hover {
 </p>"""
 
         body += "<h2>Enabled Tools</h2>"
+        body += (
+            '<p style="font-size: 0.9rem; margin: 0.5rem 0;">'
+            '<a href="/profile.txt" download>Export as --profile file</a>'
+            "</p>"
+        )
         body += quick_select
         for name, func in ORIGINAL_TOOLS.items():
             description = (
@@ -378,6 +394,20 @@ input[type="submit"]:hover {
             body += f"<label><input type='checkbox' name='{html.escape(name)}' value='{html.escape(name)}'{checked}{unsafe_attr} data-tool>{unsafe_prefix}{html.escape(name)}: {html.escape(description)}</label>"
         body += quick_select
         body += "<br><input type='submit' value='Save'>"
+
+        body += "<h2>Import Profile</h2>"
+        body += (
+            "<p style='font-size: 0.9rem; margin: 0.5rem 0;'>"
+            "Paste profile contents (one tool name per line, <code>#</code> for comments) "
+            "to replace the current Enabled Tools selection."
+            "</p>"
+        )
+        body += (
+            "<textarea name='profile_text' rows='6' "
+            "style='width:100%;font-family:monospace;' "
+            "placeholder='# paste profile here'></textarea>"
+        )
+        body += "<br><input type='submit' name='apply_profile' value='Apply profile'>"
         body += "</form></body></html>"
         self._send_html(200, body)
 
@@ -398,11 +428,12 @@ input[type="submit"]:hover {
         config_json_set("cors_policy", cors_policy)
         self.update_cors_policy()
 
-        # Update the server's tools (discovery tools cannot be disabled)
-        from .api_discovery import _LOCAL_TOOL_NAMES as PROTECTED_TOOLS
-        enabled_tools = {name: name in postvars for name in ORIGINAL_TOOLS.keys()}
-        for name in PROTECTED_TOOLS:
-            enabled_tools[name] = True
+        # Update the server's tools
+        if "apply_profile" in postvars:
+            whitelist = parse_profile(postvars.get("profile_text", [""])[0])
+            enabled_tools = {name: name in whitelist for name in ORIGINAL_TOOLS.keys()}
+        else:
+            enabled_tools = {name: name in postvars for name in ORIGINAL_TOOLS.keys()}
         self.mcp_server.tools.methods = {
             name: func
             for name, func in ORIGINAL_TOOLS.items()

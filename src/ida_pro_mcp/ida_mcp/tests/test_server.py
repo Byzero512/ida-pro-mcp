@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import json
 import os
 import sys
 
@@ -60,7 +61,7 @@ class _RecordingConnection:
 
 @contextlib.contextmanager
 def _saved_target():
-    """Preserve the currently selected IDA target across assertions."""
+    """Preserve the currently configured IDA target across assertions."""
     old_host = server.IDA_HOST
     old_port = server.IDA_PORT
     old_session = getattr(server.mcp._transport_session_id, "data", None)
@@ -75,31 +76,50 @@ def _saved_target():
 
 
 @test()
-def test_tools_list_keeps_discovery_and_launch_tools_when_ida_unreachable():
-    """tools/list should still expose local discovery/recovery tools when IDA is down."""
-    with _saved_target():
-        server.IDA_HOST = "127.0.0.1"
-        server.IDA_PORT = 1  # unreachable
-        req = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
-        result = server.dispatch_proxy(req)
-        assert "result" in result, f"Expected successful tools/list response, got: {result}"
-        tool_names = {tool["name"] for tool in result["result"].get("tools", [])}
-        assert "select_instance" in tool_names
-        assert "list_instances" in tool_names
-        assert "open_file" in tool_names
+def test_streamable_http_initialize_returns_session_id():
+    """Streamable HTTP initialize should issue a session id for per-client state."""
+    test_mcp = server.McpServer("session-test")
+    test_mcp.serve("127.0.0.1", 0, request_handler=server.McpHttpRequestHandler)
+    port = test_mcp._http_server.server_address[1]
+    conn = server.http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        payload = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "1.0"},
+                },
+            }
+        )
+        conn.request("POST", "/mcp", payload, {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        response.read()
+        session_id = response.getheader("Mcp-Session-Id")
+        assert response.status == 200
+        assert session_id, "Expected initialize response to include Mcp-Session-Id"
+        assert test_mcp.has_http_session(session_id)
+    finally:
+        conn.close()
+        test_mcp.stop()
 
 
 @test()
-def test_server_proxy_to_instance_forwards_session_and_extensions():
-    """Top-level proxy requests should preserve MCP session and enabled extensions."""
+def test_server_proxy_to_ida_forwards_session_and_extensions():
+    """Proxy requests should preserve MCP session and enabled extensions."""
     with _saved_target():
         original_conn = server.http.client.HTTPConnection
         _RecordingConnection.calls = []
         server.http.client.HTTPConnection = _RecordingConnection
+        server.IDA_HOST = "127.0.0.1"
+        server.IDA_PORT = 13337
         server.mcp._transport_session_id.data = "http:session-456"
         server.mcp._enabled_extensions.data = {"dbg"}
         try:
-            server._proxy_to_instance("127.0.0.1", 13337, b"{}")
+            server._proxy_to_ida(b"{}")
             assert len(_RecordingConnection.calls) == 1
             call = _RecordingConnection.calls[0]
             assert call["path"] == "/mcp?ext=dbg"
@@ -152,7 +172,7 @@ def test_ida_rpc_ext_flows_through_to_proxy_path():
         try:
             args = argparse.Namespace(ida_rpc="http://10.0.0.1:9999/mcp?ext=dbg")
             server._resolve_ida_rpc(args)
-            server._proxy_to_instance("10.0.0.1", 9999, b"{}")
+            server._proxy_to_ida(b"{}")
             assert len(_RecordingConnection.calls) == 1
             assert _RecordingConnection.calls[0]["path"] == "/mcp?ext=dbg"
         finally:
