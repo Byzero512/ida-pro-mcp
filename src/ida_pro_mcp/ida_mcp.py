@@ -10,7 +10,6 @@ import threading
 import idaapi
 import ida_kernwin
 import ida_netnode
-import ida_nalt
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -308,10 +307,11 @@ class MCPUIHooks(ida_kernwin.UI_Hooks):
         ida_kernwin.attach_action_to_menu(
             "Edit/Plugins/", CONFIG_ACTION_ID, idaapi.SETMENU_APP
         )
-        # Skip autostart when running under idalib – the idalib_server manages
-        # the MCP server lifecycle itself and would otherwise hit a port conflict
-        # because unload_package creates a separate MCP_SERVER instance.
-        if self.plugin.autostart and ida_kernwin.is_idaq():
+        # An idalib server with --port manages the MCP lifecycle externally.
+        # Standalone idalib sessions without a managed port may autostart here.
+        if self.plugin.autostart and (
+            ida_kernwin.is_idaq() or self.plugin.idalib_port is None
+        ):
             print("[MCP] Autostarting server...")
             self.plugin.run(0)
         self.unhook()
@@ -444,12 +444,14 @@ class MCP(idaapi.plugin_t):
             traceback.print_exc()
 
     def _start_named_pipe(self, url: str):
-        input_path = ida_nalt.get_input_file_path() or ""
-        if not input_path:
-            print("[MCP] Named pipe not started: input file path is unavailable")
+        import idc
+
+        database_path = idc.get_idb_path() or ""
+        if not database_path:
+            print("[MCP] Named pipe not started: database path is unavailable")
             return
 
-        normalized_path = os.path.abspath(input_path).replace("\\", "/")
+        normalized_path = os.path.abspath(database_path).replace("\\", "/")
         pipe_name = f"idamcp${normalized_path}"
         server = _NamedPipeUrlServer(pipe_name, url)
         try:
