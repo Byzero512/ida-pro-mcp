@@ -6,9 +6,11 @@ It loads the actual implementation from the ida_mcp package.
 
 import os
 import sys
+import threading
 import idaapi
 import ida_kernwin
 import ida_netnode
+import ida_nalt
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -20,6 +22,107 @@ NETNODE_CONFIG = "$ ida_mcp.config"
 _ALT_PORT = 0  # altval index for the persisted port (0 = not set)
 _ALT_PERSIST = 1  # altval index for the "save host/port" preference
 _SUP_HOST = 0  # supval index for the persisted host
+
+
+class _NamedPipeUrlServer:
+    """Expose an MCP URL through a binary-specific Windows named pipe."""
+
+    def __init__(self, pipe_name: str, url: str):
+        self.pipe_name = pipe_name
+        self.url = url
+        self._ready = threading.Event()
+        self._stop = threading.Event()
+        self._listener = None
+        self._error: Exception | None = None
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name="ida-mcp-named-pipe",
+            daemon=True,
+        )
+
+    def start(self):
+        self._thread.start()
+        if not self._ready.wait(timeout=5):
+            raise TimeoutError(f"Timed out creating named pipe {self.pipe_name!r}")
+        if self._error is not None:
+            raise RuntimeError(
+                f"Failed to create named pipe {self.pipe_name!r}"
+            ) from self._error
+
+    def stop(self):
+        if not self._thread.is_alive():
+            return
+
+        self._stop.set()
+
+        async def wake_listener():
+            from ifastmcp import NamedPipe
+
+            connection = await NamedPipe.connect(
+                self.pipe_name, timeout_seconds=0.5
+            )
+            await connection.close()
+
+        try:
+            import anyio
+
+            anyio.run(wake_listener)
+        except Exception:
+            pass
+        self._thread.join(timeout=2)
+
+    def _thread_main(self):
+        try:
+            import anyio
+
+            anyio.run(self._serve)
+        except Exception as e:
+            self._error = e
+            if self._ready.is_set():
+                print(f"[MCP] Named pipe server failed: {e}")
+        finally:
+            self._ready.set()
+
+    async def _serve(self):
+        from ifastmcp import NamedPipe
+
+        listener = await NamedPipe.listen(self.pipe_name, first_instance=True)
+        self._listener = listener
+        self._ready.set()
+        try:
+            while not self._stop.is_set():
+                try:
+                    connection = await listener.accept()
+                except OSError as e:
+                    if self._stop.is_set():
+                        break
+                    if e.errno in (109, 232, 233, 995):
+                        continue
+                    raise
+                try:
+                    if not self._stop.is_set():
+                        await connection.write(self.url.encode("utf-8"))
+                except Exception as e:
+                    if not self._stop.is_set():
+                        print(f"[MCP] Named pipe connection failed: {e}")
+                finally:
+                    await connection.close()
+        finally:
+            self._listener = None
+            await listener.close()
+
+
+def _get_argv_value(option: str) -> str | None:
+    """Return the value following an option in the current process arguments."""
+    try:
+        index = sys.argv.index(option)
+    except ValueError:
+        return None
+
+    value_index = index + 1
+    if value_index >= len(sys.argv) or sys.argv[value_index].startswith("--"):
+        return None
+    return sys.argv[value_index]
 
 
 def _get_autostart() -> bool:
@@ -222,7 +325,7 @@ class MCP(idaapi.plugin_t):
     wanted_hotkey = "Ctrl-Alt-M"
 
     DEFAULT_HOST = "127.0.0.1"
-    DEFAULT_PORT = 13337
+    DEFAULT_PORT = 0
 
     def init(self):
         hotkey = MCP.wanted_hotkey.replace("-", "+")
@@ -230,13 +333,14 @@ class MCP(idaapi.plugin_t):
             hotkey = hotkey.replace("Alt", "Option")
 
         self.mcp: "ida_mcp.rpc.McpServer | None" = None
-        # self.host = self.DEFAULT_HOST
-        # self.port = self.DEFAULT_PORT
+        self.named_pipe: _NamedPipeUrlServer | None = None
+        self.idalib_host: str | None = None
+        self.idalib_port: str | None = None
         self.host = os.environ.get("IDAMCP_HOST", self.DEFAULT_HOST)
         self.port = int(os.environ.get("IDAMCP_PORT", str(self.DEFAULT_PORT)))
 
         try:
-            self.autostart = bool(int(os.environ.get("IDAMCP_AUTOSTART", str(1 if _get_autostart() else 0))))
+            self.autostart = bool(int(os.environ.get("IDAMCP_AUTOSTART", 1)))
         except:
             print(f"[MCP] Warning: Invalid value for IDAMCP_AUTOSTART, defaulting to {_get_autostart()}")
             self.autostart = _get_autostart()
@@ -245,6 +349,12 @@ class MCP(idaapi.plugin_t):
             print("[MCP] Plugin loaded, server will start automatically")
         elif not ida_kernwin.is_idaq():
             print("[MCP] Plugin loaded (idalib mode, server managed externally)")
+            self.idalib_host = _get_argv_value("--host") or self.DEFAULT_HOST
+            self.idalib_port = _get_argv_value("--port")
+            if self.idalib_port is not None:
+                self._start_named_pipe(
+                    f"http://{self.idalib_host}:{self.idalib_port}/mcp"
+                )
         else:
             print(
                 f"[MCP] Plugin loaded, use Edit -> Plugins -> MCP ({hotkey}) to start the server"
@@ -278,6 +388,7 @@ class MCP(idaapi.plugin_t):
             self._registered_port = None
 
     def run(self, arg):
+        self._stop_named_pipe()
         if self.mcp:
             self._unregister_instance()
             self.mcp.stop()
@@ -290,23 +401,21 @@ class MCP(idaapi.plugin_t):
         else:
             from ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler
 
-        port = self.port
-        max_port = port + 100
-        while port < max_port:
-            try:
-                MCP_SERVER.serve(
-                    self.host, port, request_handler=IdaMcpHttpRequestHandler
-                )
-                print(f"  Config: http://{self.host}:{port}/config.html")
-                self.mcp = MCP_SERVER
-                self._register_instance(port)
-                return
-            except OSError as e:
-                if e.errno in (48, 98, 10048):  # Address already in use
-                    port += 1
-                else:
-                    raise
-        print(f"[MCP] Error: No available port in range {self.port}-{max_port - 1}")
+        try:
+            MCP_SERVER.serve(
+                self.host, self.port, request_handler=IdaMcpHttpRequestHandler
+            )
+            self.mcp = MCP_SERVER
+            if self.port == 0:
+                if MCP_SERVER._http_server is None:
+                    raise RuntimeError("MCP server did not expose its bound port")
+                self.port = int(MCP_SERVER._http_server.server_port)
+            self._register_instance(self.port)
+            self._start_named_pipe(f"http://{self.host}:{self.port}/mcp")
+            print(f"  Config: http://{self.host}:{self.port}/config.html")
+            return
+        except OSError as e:
+            print(f"[MCP] Error: port Not available: {self.port}")
 
     def _register_instance(self, port: int):
         try:
@@ -334,11 +443,35 @@ class MCP(idaapi.plugin_t):
             print(f"[MCP] Instance registration failed: {e}")
             traceback.print_exc()
 
+    def _start_named_pipe(self, url: str):
+        input_path = ida_nalt.get_input_file_path() or ""
+        if not input_path:
+            print("[MCP] Named pipe not started: input file path is unavailable")
+            return
+
+        normalized_path = os.path.abspath(input_path).replace("\\", "/")
+        pipe_name = f"idamcp${normalized_path}"
+        server = _NamedPipeUrlServer(pipe_name, url)
+        try:
+            server.start()
+        except Exception as e:
+            print(f"[MCP] Named pipe creation failed: {e}")
+            return
+
+        self.named_pipe = server
+        print(f"[MCP] Named pipe: {pipe_name} -> {url}")
+
+    def _stop_named_pipe(self):
+        if self.named_pipe is not None:
+            self.named_pipe.stop()
+            self.named_pipe = None
+
     def term(self):
         if hasattr(self, "_ui_hooks"):
             self._ui_hooks.unhook()
         ida_kernwin.unregister_action(CONFIG_ACTION_ID)
         self._unregister_instance()
+        self._stop_named_pipe()
         if self.mcp:
             self.mcp.stop()
 
