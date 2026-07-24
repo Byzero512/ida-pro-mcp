@@ -39,42 +39,32 @@ class _NamedPipeUrlServer:
             daemon=True,
         )
 
-    def start(self):
+    def start(self) -> None:
         self._thread.start()
         if not self._ready.wait(timeout=5):
             raise TimeoutError(f"Timed out creating named pipe {self.pipe_name!r}")
         if self._error is not None:
             raise RuntimeError(
-                f"Failed to create named pipe {self.pipe_name!r}"
+                f"Failed to create named pipe {self.pipe_name!r}: {self._error}"
             ) from self._error
 
-    def stop(self):
+    def stop(self) -> None:
         if not self._thread.is_alive():
             return
 
         self._stop.set()
-
-        async def wake_listener():
+        try:
             from ifastmcp import NamedPipe
 
-            connection = await NamedPipe.connect(
-                self.pipe_name, timeout_seconds=0.5
-            )
-            await connection.close()
-
-        try:
-            import anyio
-
-            anyio.run(wake_listener)
+            connection = NamedPipe.connect(self.pipe_name, timeout_seconds=0.5)
+            connection.close()
         except Exception:
             pass
         self._thread.join(timeout=2)
 
-    def _thread_main(self):
+    def _thread_main(self) -> None:
         try:
-            import anyio
-
-            anyio.run(self._serve)
+            self._serve()
         except Exception as e:
             self._error = e
             if self._ready.is_set():
@@ -82,16 +72,16 @@ class _NamedPipeUrlServer:
         finally:
             self._ready.set()
 
-    async def _serve(self):
+    def _serve(self) -> None:
         from ifastmcp import NamedPipe
 
-        listener = await NamedPipe.listen(self.pipe_name, first_instance=True)
+        listener = NamedPipe.listen(self.pipe_name, first_instance=True)
         self._listener = listener
         self._ready.set()
         try:
             while not self._stop.is_set():
                 try:
-                    connection = await listener.accept()
+                    connection = listener.accept()
                 except OSError as e:
                     if self._stop.is_set():
                         break
@@ -100,15 +90,15 @@ class _NamedPipeUrlServer:
                     raise
                 try:
                     if not self._stop.is_set():
-                        await connection.write(self.url.encode("utf-8"))
+                        connection.write(self.url.encode("utf-8"))
                 except Exception as e:
                     if not self._stop.is_set():
                         print(f"[MCP] Named pipe connection failed: {e}")
                 finally:
-                    await connection.close()
+                    connection.close()
         finally:
             self._listener = None
-            await listener.close()
+            listener.close()
 
 
 def _get_argv_value(option: str) -> str | None:
